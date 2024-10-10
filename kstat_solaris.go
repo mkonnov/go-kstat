@@ -60,9 +60,46 @@ import "C"
 import (
 	"errors"
 	"fmt"
+	"regexp"
 	"runtime"
 	"unsafe"
 )
+
+type StringMatchable interface {
+	MatchString(string) bool
+}
+
+type MatchableString string
+
+func (m MatchableString) MatchString(s string) bool {
+	return string(m) == s
+}
+
+type KStatQuery struct {
+	module   StringMatchable
+	instance *int
+	name     StringMatchable
+}
+
+func NewKStatQuery(module StringMatchable, instance *int, name StringMatchable) KStatQuery {
+	return KStatQuery{
+		module:   module,
+		instance: instance,
+		name:     name,
+	}
+}
+
+type NamedQuery struct {
+	KStatQuery
+	statistics StringMatchable
+}
+
+func NewNamedQuery(module StringMatchable, instance *int, name, statistics StringMatchable) NamedQuery {
+	return NamedQuery{
+		KStatQuery: NewKStatQuery(module, instance, name),
+		statistics: statistics,
+	}
+}
 
 // Token is an access token for obtaining kstats.
 type Token struct {
@@ -222,7 +259,6 @@ func (t *Token) All() []*KStat {
 	return n
 }
 
-//
 // allocate a C string for a non-blank string; otherwise return nil
 func maybeCString(src string) *C.char {
 	if src == "" {
@@ -241,6 +277,7 @@ func maybeFree(cs *C.char) {
 // strndup behaves like the C function; given a *C.char and a len, it
 // returns a string that is up to len characters long at most.
 // Shorn of casts, it is:
+//
 //	C.GoStringN(p, C.strnlen(p, len))
 //
 // strndup() is necessary to copy fields of the type 'char
@@ -296,6 +333,24 @@ func (t *Token) Lookup(module string, instance int, name string) (*KStat, error)
 	return k, nil
 }
 
+// List returns all KStats that match provided query.
+func (t *Token) List(query KStatQuery) ([]*KStat, error) {
+	kStats := t.All()
+	maxInstance := 0
+	writeI := 0
+	for _, kStat := range kStats {
+		maxInstance = max(maxInstance, kStat.Instance)
+		if matchKStat(kStat, query) {
+			kStats[writeI] = kStat
+			writeI++
+		}
+	}
+	if *query.instance > maxInstance {
+		return nil, fmt.Errorf("KStat instance out of range (max=%d)", maxInstance)
+	}
+	return kStats[:writeI], nil
+}
+
 // GetNamed obtains the Named representing a particular (named) kstat
 // module:instance:name:statistic statistic. It always returns current
 // data for the kstat statistic, even if it's called repeatedly for the
@@ -308,6 +363,59 @@ func (t *Token) GetNamed(module string, instance int, name, stat string) (*Named
 		return nil, err
 	}
 	return stats.GetNamed(stat)
+}
+
+// GetNamedRE returns the first named record that matches provided query.
+func (t *Token) GetNamedRE(query NamedQuery) (*Named, error) {
+	kStats, err := t.List(query.KStatQuery)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, kStat := range kStats {
+		if query.statistics == nil {
+			query.statistics = regexp.MustCompile(`.*`)
+		}
+
+		named, err := kStat.GetNamedRE(query.statistics)
+		if err == nil {
+			return named, nil
+		}
+
+	}
+	return nil, fmt.Errorf("no named record matching %v was found", query.statistics)
+}
+
+// ListNamedRE returns all named records that match provided query.
+func (t *Token) ListNamedRE(query NamedQuery) ([]*Named, error) {
+	kStats, err := t.List(query.KStatQuery)
+	if err != nil {
+		return nil, err
+	}
+
+	var stats []*Named
+	for _, kStat := range kStats {
+		var named []*Named
+
+		if query.statistics == nil {
+			named, err = kStat.AllNamed()
+		} else {
+			named, err = kStat.ListNamedRE(query.statistics)
+		}
+		if err != nil {
+			return nil, err
+		}
+
+		stats = append(stats, named...)
+	}
+	return stats, nil
+}
+
+// Decides whether a provided KStat matches a query.
+func matchKStat(kStat *KStat, filters KStatQuery) bool {
+	return (filters.module == nil || filters.module.MatchString(kStat.Module)) &&
+		(filters.instance == nil || *filters.instance == kStat.Instance) &&
+		(filters.name == nil || filters.name.MatchString(kStat.Name))
 }
 
 // -----
@@ -345,7 +453,6 @@ func (tp KSType) String() string {
 
 // KStat is the access handle for the collection of statistics for a
 // particular module:instance:name kstat.
-//
 type KStat struct {
 	Module   string
 	Instance int
@@ -527,6 +634,53 @@ func (k *KStat) GetNamed(name string) (*Named, error) {
 	return newNamed(k, (*C.struct_kstat_named)(r)), err
 }
 
+// GetNamedRE returns the first named statistics that matches provided
+// regular expression for a particular named-type KStat.
+func (k *KStat) GetNamedRE(name StringMatchable) (*Named, error) {
+	if name == nil {
+		return nil, errors.New("GetNamedRE requires non-nil name")
+	}
+
+	if err := k.setup(); err != nil {
+		return nil, err
+	}
+	for i := C.uint_t(0); i < k.ksp.ks_ndata; i++ {
+		ks := C.get_nth_named(k.ksp, i)
+		if ks == nil {
+			panic("get_nth_named returned surprise nil")
+		}
+		named := newNamed(k, ks)
+		if name.MatchString(named.Name) {
+			return named, nil
+		}
+	}
+	return nil, fmt.Errorf("statistics %q not found", name)
+}
+
+// ListNamedRE returns all named statistics that matches provided
+// regular expression for a particular named-type KStat.
+func (k *KStat) ListNamedRE(name StringMatchable) ([]*Named, error) {
+	if name == nil {
+		return nil, errors.New("ListNamedRE requires non-nil name")
+	}
+
+	if err := k.setup(); err != nil {
+		return nil, err
+	}
+	var list []*Named
+	for i := C.uint_t(0); i < k.ksp.ks_ndata; i++ {
+		ks := C.get_nth_named(k.ksp, i)
+		if ks == nil {
+			panic("get_nth_named returned surprise nil")
+		}
+		named := newNamed(k, ks)
+		if name.MatchString(named.Name) {
+			list = append(list, named)
+		}
+	}
+	return list, nil
+}
+
 // AllNamed returns an array of all named statistics for a particular
 // named-type KStat. Entries are returned in no particular order.
 func (k *KStat) AllNamed() ([]*Named, error) {
@@ -545,7 +699,9 @@ func (k *KStat) AllNamed() ([]*Named, error) {
 }
 
 // Named represents a particular kstat named statistic, ie the full
+//
 //	module:instance:name:statistic
+//
 // and its current value.
 //
 // Name and Type are always valid, but only one of StringVal, IntVal,
